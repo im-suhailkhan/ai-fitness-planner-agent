@@ -1,8 +1,53 @@
+import logging
 import os
 import streamlit as st
 from agno.agent import Agent
 from agno.models.groq import Groq
+from agno.run.agent import RunOutput
 from agno.tools.duckduckgo import DuckDuckGoTools
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+
+
+def _format_run_output(run: RunOutput, label: str) -> str:
+    """Human-readable summary of an agent run (content, tools, metrics)."""
+    parts: list[str] = [f"=== {label} ==="]
+    parts.append(f"agent_name={run.agent_name!r} model={run.model!r} run_id={run.run_id!r}")
+    if run.content is not None:
+        c = run.content
+        text = c if isinstance(c, str) else str(c)
+        parts.append("--- assistant content ---")
+        parts.append(text if len(text) <= 12000 else text[:12000] + "\n… [truncated]")
+    if run.tools:
+        parts.append("--- tool calls ---")
+        for t in run.tools:
+            parts.append(f"  • {t.tool_name} args={t.tool_args}")
+            if t.result:
+                r = t.result
+                parts.append(f"    result: {r}" if len(r) <= 4000 else f"    result: {r[:4000]}…")
+            if t.tool_call_error:
+                parts.append("    (tool error)")
+    if run.metrics is not None:
+        parts.append(f"--- run metrics --- {run.metrics}")
+    if run.messages:
+        parts.append(f"--- message trace ({len(run.messages)} messages) ---")
+        for msg in run.messages[-8:]:
+            role = getattr(msg, "role", None) or getattr(msg, "name", "?")
+            body = getattr(msg, "content", msg)
+            if isinstance(body, list):
+                body = str(body)
+            s = body if isinstance(body, str) else str(body)
+            parts.append(f"  [{role}] {s[:1500]}{'…' if len(s) > 1500 else ''}")
+    return "\n".join(parts)
+
+
+def _log_agent_run(label: str, run: RunOutput) -> None:
+    logger.info("\n%s", _format_run_output(run, label))
 
 # Groq reads GROQ_API_KEY from the environment (see https://console.groq.com/keys)
 try:
@@ -35,7 +80,9 @@ def get_meal_plan(age, weight, height, activity_level, dietary_preference, fitne
     prompt = (f"Create a personalized meal plan for a {age}-year-old person, weighing {weight}kg, "
               f"{height}cm tall, with an activity level of '{activity_level}', following a "
               f"'{dietary_preference}' diet, aiming to achieve '{fitness_goal}'.")
-    return dietary_planner.run(prompt)
+    out = dietary_planner.run(prompt)
+    _log_agent_run("Dietary Planner", out)
+    return out
 
 # Fitness Trainer Agent
 fitness_trainer = Agent(
@@ -58,7 +105,9 @@ def get_fitness_plan(age, weight, height, activity_level, fitness_goal):
     prompt = (f"Generate a workout plan for a {age}-year-old person, weighing {weight}kg, "
               f"{height}cm tall, with an activity level of '{activity_level}', "
               f"aiming to achieve '{fitness_goal}'. Include warm-ups, exercises, and cool-downs.")
-    return fitness_trainer.run(prompt)
+    out = fitness_trainer.run(prompt)
+    _log_agent_run("Fitness Trainer", out)
+    return out
 
 # Team Lead Agent (combines both meal and fitness plans)
 team_lead = Agent(
@@ -75,17 +124,22 @@ team_lead = Agent(
 
 # Function to get a full health plan
 def get_full_health_plan(name, age, weight, height, activity_level, dietary_preference, fitness_goal):
-    meal_plan = get_meal_plan(age, weight, height, activity_level, dietary_preference, fitness_goal)
-    fitness_plan = get_fitness_plan(age, weight, height, activity_level, fitness_goal)
-    
-    return team_lead.run(
-        f"Greet the customer,{name}\n\n"
+    meal_run = get_meal_plan(age, weight, height, activity_level, dietary_preference, fitness_goal)
+    fitness_run = get_fitness_plan(age, weight, height, activity_level, fitness_goal)
+
+    meal_text = meal_run.content if isinstance(meal_run.content, str) else str(meal_run.content or "")
+    fitness_text = fitness_run.content if isinstance(fitness_run.content, str) else str(fitness_run.content or "")
+
+    team_out = team_lead.run(
+        f"Greet the customer, {name}\n\n"
         f"User Information: {age} years old, {weight}kg, {height}cm, activity level: {activity_level}.\n\n"
         f"Fitness Goal: {fitness_goal}\n\n"
-        f"Meal Plan:\n{meal_plan}\n\n"
-        f"Workout Plan:\n{fitness_plan}\n\n"
+        f"Meal Plan:\n{meal_text}\n\n"
+        f"Workout Plan:\n{fitness_text}\n\n"
         f"Provide a holistic health strategy integrating both plans."
     )
+    _log_agent_run("Team Lead", team_out)
+    return team_out, meal_run, fitness_run
 
 
 # Set up Streamlit UI with a fitness theme
@@ -158,6 +212,7 @@ height = st.sidebar.number_input("Height (in cm)", min_value=100, max_value=250,
 activity_level = st.sidebar.selectbox("Activity Level", ["Low", "Moderate", "High"])
 dietary_preference = st.sidebar.selectbox("Dietary Preference", ["Keto", "Vegetarian", "Low Carb", "Balanced"])
 fitness_goal = st.sidebar.selectbox("Fitness Goal", ["Weight Loss", "Muscle Gain", "Endurance", "Flexibility"])
+show_agent_logs = st.sidebar.checkbox("Show agent run logs in UI", value=True)
 
 # Divider for aesthetics
 st.markdown("---")
@@ -172,13 +227,23 @@ if st.sidebar.button("Generate Health Plan"):
         st.sidebar.warning("Please fill in all required fields.")
     else:
         with st.spinner("💥 Generating your personalized health & fitness plan..."):
-            full_health_plan = get_full_health_plan(name, age, weight, height, activity_level, dietary_preference, fitness_goal)
-        
-            # Display the generated health plan in the main section
-            st.subheader("Your Personalized Health & Fitness Plan")
-            st.markdown(full_health_plan.content)
+            full_health_plan, meal_run, fitness_run = get_full_health_plan(
+                name, age, weight, height, activity_level, dietary_preference, fitness_goal
+            )
 
-            st.info("This is your customized health and fitness strategy, including meal and workout plans.")
+        st.subheader("Your Personalized Health & Fitness Plan")
+        st.markdown(full_health_plan.content)
+
+        st.info("This is your customized health and fitness strategy, including meal and workout plans.")
+
+        if show_agent_logs:
+            st.subheader("Agent run logs")
+            with st.expander("Dietary Planner — full output", expanded=False):
+                st.code(_format_run_output(meal_run, "Dietary Planner"), language=None)
+            with st.expander("Fitness Trainer — full output", expanded=False):
+                st.code(_format_run_output(fitness_run, "Fitness Trainer"), language=None)
+            with st.expander("Team Lead — full output", expanded=False):
+                st.code(_format_run_output(full_health_plan, "Team Lead"), language=None)
 
         # Motivational Message
         st.markdown("""
