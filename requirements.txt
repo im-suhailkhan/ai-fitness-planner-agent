@@ -1,0 +1,4 @@
+# Pin versions for reproducible installs; loosen as needed.
+agno==2.5.10
+groq==1.1.1
+streamlit==1.55.0
